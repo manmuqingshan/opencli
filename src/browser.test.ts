@@ -43,6 +43,52 @@ describe('browser helpers', () => {
   it('times out slow promises', async () => {
     await expect(__test__.withTimeoutMs(new Promise(() => {}), 10, 'timeout')).rejects.toThrow('timeout');
   });
+
+  it('prefers the real Electron app target over DevTools and blank pages', () => {
+    const target = __test__.selectCDPTarget([
+      {
+        type: 'page',
+        title: 'DevTools - localhost:9224',
+        url: 'devtools://devtools/bundled/inspector.html',
+        webSocketDebuggerUrl: 'ws://127.0.0.1:9224/devtools',
+      },
+      {
+        type: 'page',
+        title: '',
+        url: 'about:blank',
+        webSocketDebuggerUrl: 'ws://127.0.0.1:9224/blank',
+      },
+      {
+        type: 'app',
+        title: 'Antigravity',
+        url: 'http://localhost:3000/',
+        webSocketDebuggerUrl: 'ws://127.0.0.1:9224/app',
+      },
+    ]);
+
+    expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9224/app');
+  });
+
+  it('honors OPENCLI_CDP_TARGET when multiple inspectable targets exist', () => {
+    vi.stubEnv('OPENCLI_CDP_TARGET', 'codex');
+
+    const target = __test__.selectCDPTarget([
+      {
+        type: 'app',
+        title: 'Cursor',
+        url: 'http://localhost:3000/cursor',
+        webSocketDebuggerUrl: 'ws://127.0.0.1:9226/cursor',
+      },
+      {
+        type: 'app',
+        title: 'OpenAI Codex',
+        url: 'http://localhost:3000/codex',
+        webSocketDebuggerUrl: 'ws://127.0.0.1:9226/codex',
+      },
+    ]);
+
+    expect(target?.webSocketDebuggerUrl).toBe('ws://127.0.0.1:9226/codex');
+  });
 });
 
 describe('BrowserBridge state', () => {
