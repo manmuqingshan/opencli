@@ -8,7 +8,7 @@
  * - Shared DOM helper methods extracted to reduce duplication with Page (P1 #5)
  */
 
-import { WebSocket } from 'ws';
+import { WebSocket, type RawData } from 'ws';
 import type { IPage } from '../types.js';
 import { wrapForEval } from './utils.js';
 import {
@@ -63,12 +63,12 @@ export class CDPBridge {
         resolve(new CDPPage(this));
       });
 
-      ws.on('error', (err) => {
+      ws.on('error', (err: Error) => {
         clearTimeout(timeout);
         reject(err);
       });
 
-      ws.on('message', (data) => {
+      ws.on('message', (data: RawData) => {
         try {
           const msg = JSON.parse(data.toString());
           // Handle command responses
