@@ -10,6 +10,7 @@
  */
 
 import { cli, Strategy } from '../../registry.js';
+import type { IPage } from '../../types.js';
 
 type CreatorNoteDetailRow = {
   section: string;
@@ -285,124 +286,50 @@ export function appendTrendRows(rows: CreatorNoteDetailRow[], payload?: NoteDeta
   return rows;
 }
 
-function deriveCdpHttpBase(endpoint?: string): string | null {
-  if (!endpoint) return null;
-  try {
-    const url = new URL(endpoint);
-    if (url.protocol === 'ws:' || url.protocol === 'wss:') {
-      url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
-      url.pathname = '';
-      url.search = '';
-      url.hash = '';
-      return url.toString().replace(/\/$/, '');
-    }
-    return `${url.protocol}//${url.host}`;
-  } catch {
-    return null;
-  }
-}
+const DETAIL_API_ENDPOINTS: Array<{ suffix: string; key: keyof NoteDetailApiPayload }> = [
+  { suffix: '/api/galaxy/creator/datacenter/note/base', key: 'noteBase' },
+  { suffix: '/api/galaxy/creator/datacenter/note/analyze/audience/trend', key: 'audienceTrend' },
+  { suffix: '/api/galaxy/creator/datacenter/note/audience/source/detail', key: 'audienceSourceDetail' },
+  { suffix: '/api/galaxy/creator/datacenter/note/audience', key: 'audienceSource' },
+];
 
-function resolveRequestedCdpEndpoint(): { endpoint: string | null; requestedCdp: boolean } {
-  const endpoint = process.env.OPENCLI_CDP_ENDPOINT?.trim();
-  return {
-    endpoint: endpoint || null,
-    requestedCdp: Boolean(endpoint),
-  };
-}
-
-async function captureNoteDetailApiPayload(noteId: string): Promise<NoteDetailApiPayload | null> {
-  const { endpoint, requestedCdp } = resolveRequestedCdpEndpoint();
-  if (!requestedCdp) return null;
-
-  const httpBase = deriveCdpHttpBase(endpoint ?? 'http://127.0.0.1:9222') ?? 'http://127.0.0.1:9222';
-  const targets = await fetch(`${httpBase}/json/list`).then((resp) => resp.json()) as Array<{
-    url?: string;
-    webSocketDebuggerUrl?: string;
-  }>;
-  const target = targets.find((entry) => entry.url?.includes(`/statistics/note-detail?noteId=${noteId}`) && entry.webSocketDebuggerUrl);
-  if (!target?.webSocketDebuggerUrl) return null;
-
-  const ws = new WebSocket(target.webSocketDebuggerUrl);
+async function captureNoteDetailPayload(page: IPage, noteId: string): Promise<NoteDetailApiPayload | null> {
   const payload: NoteDetailApiPayload = {};
-  const pending = new Map<number, { resolve: (value: any) => void; reject: (err: Error) => void }>();
-  const desiredUrls = new Map<string, keyof NoteDetailApiPayload>([
-    [`/api/galaxy/creator/datacenter/note/base?note_id=${noteId}`, 'noteBase'],
-    [`/api/galaxy/creator/datacenter/note/analyze/audience/trend?note_id=${noteId}`, 'audienceTrend'],
-    [`/api/galaxy/creator/datacenter/note/audience/source?note_id=${noteId}`, 'audienceSource'],
-    [`/api/galaxy/creator/datacenter/note/audience/source/detail?note_id=${noteId}`, 'audienceSourceDetail'],
-  ]);
-  let nextId = 1;
+  let captured = 0;
 
-  const send = (method: string, params: Record<string, unknown> = {}) => {
-    const id = nextId++;
-    ws.send(JSON.stringify({ id, method, params }));
-    return new Promise<any>((resolve, reject) => {
-      pending.set(id, { resolve, reject });
-    });
-  };
-
-  const completed = new Set<keyof NoteDetailApiPayload>();
-  const waitForPayload = new Promise<void>((resolve) => {
-    const timeout = setTimeout(() => resolve(), 8000);
-    ws.addEventListener('message', async (event) => {
-      const msg = JSON.parse(String(event.data));
-      if (typeof msg.id === 'number' && pending.has(msg.id)) {
-        const waiter = pending.get(msg.id)!;
-        pending.delete(msg.id);
-        if (msg.error) waiter.reject(new Error(msg.error.message));
-        else waiter.resolve(msg.result);
-        return;
-      }
-
-      if (msg.method === 'Network.responseReceived') {
-        const requestId = msg.params?.requestId as string | undefined;
-        const responseUrl = msg.params?.response?.url as string | undefined;
-        if (!requestId || !responseUrl) return;
-        for (const [suffix, key] of desiredUrls) {
-          if (!responseUrl.includes(suffix)) continue;
+  // Try to fetch each API endpoint through the page context (uses the browser's cookies)
+  for (const { suffix, key } of DETAIL_API_ENDPOINTS) {
+    const apiUrl = `${suffix}?note_id=${noteId}`;
+    try {
+      const data = await page.evaluate(`
+        async () => {
           try {
-            const bodyResult = await send('Network.getResponseBody', { requestId });
-            const parsed = JSON.parse(bodyResult.body);
-            payload[key] = parsed.data ?? {};
-            completed.add(key);
-            if (completed.size === desiredUrls.size) {
-              clearTimeout(timeout);
-              resolve();
-            }
-          } catch {}
+            const resp = await fetch(${JSON.stringify(apiUrl)}, { credentials: 'include' });
+            if (!resp.ok) return null;
+            const json = await resp.json();
+            return JSON.stringify(json.data ?? {});
+          } catch { return null; }
         }
+      `);
+      if (data && typeof data === 'string') {
+        try {
+          payload[key] = JSON.parse(data);
+          captured++;
+        } catch {}
       }
-    });
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    ws.addEventListener('open', () => resolve(), { once: true });
-    ws.addEventListener('error', () => reject(new Error('Failed to connect to CDP note-detail target')), { once: true });
-  });
-
-  try {
-    await send('Network.enable');
-    await send('Page.enable');
-    await send('Page.reload', { ignoreCache: true });
-    await waitForPayload;
-  } finally {
-    for (const waiter of pending.values()) {
-      waiter.reject(new Error('CDP note detail capture closed'));
-    }
-    pending.clear();
-    ws.close();
+    } catch {}
   }
 
-  return completed.size > 0 ? payload : null;
+  return captured > 0 ? payload : null;
 }
 
-export async function fetchCreatorNoteDetailRows(page: any, noteId: string): Promise<CreatorNoteDetailRow[]> {
+export async function fetchCreatorNoteDetailRows(page: IPage, noteId: string): Promise<CreatorNoteDetailRow[]> {
   await page.goto(`https://creator.xiaohongshu.com/statistics/note-detail?noteId=${encodeURIComponent(noteId)}`);
   await page.wait(4);
 
   const bodyText = await page.evaluate('() => document.body.innerText');
   const rows = parseCreatorNoteDetailText(typeof bodyText === 'string' ? bodyText : '', noteId);
-  const apiPayload = await captureNoteDetailApiPayload(noteId).catch(() => null);
+  const apiPayload = await captureNoteDetailPayload(page, noteId).catch(() => null);
   appendTrendRows(rows, apiPayload ?? undefined);
   appendAudienceRows(rows, apiPayload ?? undefined);
 

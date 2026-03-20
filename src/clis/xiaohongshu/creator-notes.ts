@@ -9,6 +9,7 @@
  */
 
 import { cli, Strategy } from '../../registry.js';
+import type { IPage } from '../../types.js';
 
 const DATE_LINE_RE = /^发布于 (\d{4}年\d{2}月\d{2}日 \d{2}:\d{2})$/;
 const METRIC_LINE_RE = /^\d+$/;
@@ -134,7 +135,7 @@ function mapAnalyzeItems(items: NonNullable<CreatorAnalyzeApiResponse['data']>['
   }));
 }
 
-async function fetchCreatorNotesByApi(page: any, limit: number): Promise<CreatorNoteRow[]> {
+async function fetchCreatorNotesByApi(page: IPage, limit: number): Promise<CreatorNoteRow[]> {
   const pageSize = Math.min(Math.max(limit, 10), 20);
   const maxPages = Math.max(1, Math.ceil(limit / pageSize));
   const notes: CreatorNoteRow[] = [];
@@ -183,145 +184,8 @@ async function fetchCreatorNotesByApi(page: any, limit: number): Promise<Creator
   return notes.slice(0, limit);
 }
 
-function deriveCdpHttpBase(endpoint?: string): string | null {
-  if (!endpoint) return null;
-  try {
-    const url = new URL(endpoint);
-    if (url.protocol === 'ws:' || url.protocol === 'wss:') {
-      url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
-      url.pathname = '';
-      url.search = '';
-      url.hash = '';
-      return url.toString().replace(/\/$/, '');
-    }
-    return `${url.protocol}//${url.host}`;
-  } catch {
-    return null;
-  }
-}
-
-function resolveRequestedCdpEndpoint(): { endpoint: string | null; requestedCdp: boolean } {
-  const endpoint = process.env.OPENCLI_CDP_ENDPOINT?.trim();
-  return {
-    endpoint: endpoint || null,
-    requestedCdp: Boolean(endpoint),
-  };
-}
-
-async function fetchCreatorNotesByCdp(limit: number): Promise<CreatorNoteRow[]> {
-  if (process.env.VITEST) return [];
-
-  const { endpoint, requestedCdp } = resolveRequestedCdpEndpoint();
-  if (!requestedCdp) return [];
-
-  const httpBase = deriveCdpHttpBase(endpoint ?? 'http://127.0.0.1:9222') ?? 'http://127.0.0.1:9222';
-  const targets = await fetch(`${httpBase}/json/list`).then((resp) => resp.json()) as Array<{
-    url?: string;
-    webSocketDebuggerUrl?: string;
-  }>;
-  const target = targets.find((entry) => entry.url?.includes('/statistics/data-analysis') && entry.webSocketDebuggerUrl);
-  if (!target?.webSocketDebuggerUrl) return [];
-
-  const ws = new WebSocket(target.webSocketDebuggerUrl);
-  let nextId = 1;
-  const pending = new Map<number, { resolve: (value: any) => void; reject: (err: Error) => void }>();
-
-  const send = (method: string, params: Record<string, unknown> = {}) => {
-    const id = nextId++;
-    ws.send(JSON.stringify({ id, method, params }));
-    return new Promise<any>((resolve, reject) => {
-      pending.set(id, { resolve, reject });
-    });
-  };
-
-  const handlePendingMessage = (event: MessageEvent) => {
-    const msg = JSON.parse(String(event.data));
-    if (typeof msg.id !== 'number' || !pending.has(msg.id)) return;
-    const waiter = pending.get(msg.id)!;
-    pending.delete(msg.id);
-    if (msg.error) waiter.reject(new Error(msg.error.message));
-    else waiter.resolve(msg.result);
-  };
-
-  ws.addEventListener('message', handlePendingMessage);
-
-  await new Promise<void>((resolve, reject) => {
-    ws.addEventListener('open', () => resolve(), { once: true });
-    ws.addEventListener('error', () => reject(new Error('Failed to connect to CDP data-analysis target')), { once: true });
-  });
-
-  const pageSize = Math.min(Math.max(limit, 10), 20);
-  const maxPages = Math.max(1, Math.ceil(limit / pageSize));
-  const notes: CreatorNoteRow[] = [];
-
-  try {
-    await send('Network.enable');
-    await send('Page.enable');
-
-    for (let pageNum = 1; pageNum <= maxPages && notes.length < limit; pageNum++) {
-      const apiSuffix = `${NOTE_ANALYZE_API_PATH}?type=0&page_size=${pageSize}&page_num=${pageNum}`;
-      const pageUrl = `https://creator.xiaohongshu.com/statistics/data-analysis?type=0&page_size=${pageSize}&page_num=${pageNum}`;
-
-      const payload = await new Promise<CreatorAnalyzeApiResponse | null>((resolve) => {
-        const listener = async (event: MessageEvent) => {
-          const msg = JSON.parse(String(event.data));
-          if (typeof msg.id === 'number') return;
-
-          if (msg.method !== 'Network.responseReceived') return;
-          const requestId = msg.params?.requestId as string | undefined;
-          const responseUrl = msg.params?.response?.url as string | undefined;
-          if (!requestId || !responseUrl || !responseUrl.includes(apiSuffix)) return;
-
-          try {
-            const bodyResult = await send('Network.getResponseBody', { requestId });
-            const parsed = JSON.parse(bodyResult.body) as CreatorAnalyzeApiResponse;
-            clearTimeout(timeout);
-            ws.removeEventListener('message', listener);
-            resolve(parsed);
-          } catch {
-            clearTimeout(timeout);
-            ws.removeEventListener('message', listener);
-            resolve(null);
-          }
-        };
-
-        const timeout = setTimeout(() => {
-          ws.removeEventListener('message', listener);
-          resolve(null);
-        }, 8000);
-
-        ws.addEventListener('message', listener);
-        void send('Page.navigate', { url: pageUrl }).catch(() => {
-          clearTimeout(timeout);
-          ws.removeEventListener('message', listener);
-          resolve(null);
-        });
-      });
-
-      const items = payload?.data?.note_infos ?? [];
-      if (!items.length) break;
-
-      notes.push(...mapAnalyzeItems(items));
-      if (items.length < pageSize) break;
-    }
-  } finally {
-    ws.removeEventListener('message', handlePendingMessage);
-    for (const waiter of pending.values()) {
-      waiter.reject(new Error('CDP creator-notes capture closed'));
-    }
-    pending.clear();
-    ws.close();
-  }
-
-  return notes.slice(0, limit);
-}
-
-export async function fetchCreatorNotes(page: any, limit: number): Promise<CreatorNoteRow[]> {
-  let notes = await fetchCreatorNotesByCdp(limit).catch(() => []);
-
-  if (notes.length === 0) {
-    notes = await fetchCreatorNotesByApi(page, limit);
-  }
+export async function fetchCreatorNotes(page: IPage, limit: number): Promise<CreatorNoteRow[]> {
+  let notes = await fetchCreatorNotesByApi(page, limit);
 
   if (notes.length === 0) {
     await page.goto('https://creator.xiaohongshu.com/new/note-manager');
